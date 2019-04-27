@@ -1,4 +1,4 @@
-# xlsx [![GoDoc](https://godoc.org/github.com/zignd/xlsx?status.svg)](https://godoc.org/github.com/zignd/xlsx)  
+# xlsx [![GoDoc](https://godoc.org/github.com/zignd/xlsx?status.svg)](https://godoc.org/github.com/zignd/xlsx) [![Go Report Card](https://goreportcard.com/badge/github.com/zignd/xlsx)](https://goreportcard.com/report/github.com/zignd/xlsx)
 
 Lets you create XLSX files incrementally, writing them to disk in order to avoid high memory usage.
 
