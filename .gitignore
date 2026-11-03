@@ -19,6 +19,20 @@ _cgo_export.*
 
 _testmain.go
 
+# Binaries and test output
 *.exe
 *.test
 *.prof
+*.out
+coverage.*
+
+# Generated spreadsheets from local experiments
+*.xlsx
+*.xlsm
+*.xls
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp

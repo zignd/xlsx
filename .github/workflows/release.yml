@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to publish (for example v1.2.3)
+        type: string
+        required: true
+  workflow_call:
+    inputs:
+      tag:
+        description: Existing tag to publish
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  GOFLAGS: -mod=readonly
+
+jobs:
+  release:
+    name: Publish ${{ inputs.tag || github.ref_name }}
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Validate the SemVer tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG}"
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$tag' is not a valid semantic version (expected vMAJOR.MINOR.PATCH[-prerelease])."
+            exit 1
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - name: Verify the module
+        run: go mod verify
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Scan for vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      - name: Create the GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG}"
+
+          args=(release create "$tag" --verify-tag --title "$tag" --generate-notes)
+          if [[ "$tag" == *-* ]]; then
+            args+=(--prerelease)
+          fi
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists, nothing to do."
+          else
+            gh "${args[@]}"
+          fi
+
+      - name: Print module proxy hint
+        run: |
+          echo "The module will be available through proxy.golang.org shortly:"
+          echo "  go get github.com/zignd/xlsx@${RELEASE_TAG}"

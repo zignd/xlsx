@@ -1,81 +1,63 @@
 package xlsx
 
-import "fmt"
+import (
+	"strconv"
+	"strings"
+)
 
+// createIdentifierFromCoords returns an A1-style cell reference from
+// zero-based column and row coordinates.
 func createIdentifierFromCoords(x, y int) string {
-	letterPart := numericToLetters(x)
-	numericPart := y + 1
-	return fmt.Sprintf("%s%d", letterPart, numericPart)
+	return numericToLetters(x) + strconv.Itoa(y+1)
 }
 
+// numericToLetters converts a zero-based column index into its spreadsheet
+// letters (0 -> A, 25 -> Z, 26 -> AA, 701 -> ZZ, 702 -> AAA).
 func numericToLetters(colRef int) string {
-	parts := intToBase26(colRef)
-	return formatColumnName(smooshBase26Slice(parts))
+	if colRef < 0 {
+		return ""
+	}
+
+	// Excel columns are bijective base-26: there is no zero digit.
+	var reversed []byte
+	for colRef >= 0 {
+		reversed = append(reversed, byte(colRef%26)+'A')
+		colRef = colRef/26 - 1
+	}
+
+	for i, j := 0, len(reversed)-1; i < j; i, j = i+1, j-1 {
+		reversed[i], reversed[j] = reversed[j], reversed[i]
+	}
+	return string(reversed)
 }
 
-func intToBase26(x int) (parts []int) {
-	// Excel column codes are pure evil - in essence they're just
-	// base26, but they don't represent the number 0.
-	b26Denominator, _ := getLargestDenominator(x, 1, 26, 0)
-
-	// This loop terminates because integer division of 1 / 26
-	// returns 0.
-	for d := b26Denominator; d > 0; d = d / 26 {
-		value := x / d
-		remainder := x % d
-		parts = append(parts, value)
-		x = remainder
-	}
-	return parts
-}
-
-func getLargestDenominator(numerator, multiple, baseDenominator, power int) (int, int) {
-	if numerator/multiple == 0 {
-		return 1, power
-	}
-	next, nextPower := getLargestDenominator(
-		numerator, multiple*baseDenominator, baseDenominator, power+1)
-	if next > multiple {
-		return next, nextPower
-	}
-	return multiple, power
-}
-
-func smooshBase26Slice(b26 []int) []int {
-	// Smoosh values together, eliminating 0s from all but the
-	// least significant part.
-	lastButOnePart := len(b26) - 2
-	for i := lastButOnePart; i > 0; i-- {
-		part := b26[i]
-		if part == 0 {
-			greaterPart := b26[i-1]
-			if greaterPart > 0 {
-				b26[i-1] = greaterPart - 1
-				b26[i] = 26
+func xmlEscape(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch r {
+		case '&':
+			b.WriteString("&amp;")
+		case '<':
+			b.WriteString("&lt;")
+		case '>':
+			b.WriteString("&gt;")
+		case '"':
+			b.WriteString("&quot;")
+		case '\'':
+			b.WriteString("&apos;")
+		default:
+			if validXMLRune(r) {
+				b.WriteRune(r)
 			}
 		}
 	}
-	return b26
+	return b.String()
 }
 
-func formatColumnName(colID []int) string {
-	lastPart := len(colID) - 1
-
-	result := ""
-	for n, part := range colID {
-		if n == lastPart {
-			// The least significant number is in the
-			// range 0-25, all other numbers are 1-26,
-			// hence we use a different offset for the
-			// last part.
-			result += string(part + 65)
-		} else {
-			// Don't output leading 0s, as there is no
-			// representation of 0 in this format.
-			if part > 0 {
-				result += string(part + 64)
-			}
-		}
-	}
-	return result
+func validXMLRune(r rune) bool {
+	return r == '\t' || r == '\n' || r == '\r' ||
+		(r >= 0x20 && r <= 0xD7FF) ||
+		(r >= 0xE000 && r <= 0xFFFD) ||
+		(r >= 0x10000 && r <= 0x10FFFF)
 }

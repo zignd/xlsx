@@ -1,0 +1,134 @@
+name: Tag release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Semantic version component to bump
+        type: choice
+        required: true
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+      prerelease:
+        description: Optional prerelease suffix (for example rc.1)
+        type: string
+        required: false
+        default: ""
+      version:
+        description: Exact tag to create, overriding bump and prerelease (for example v1.2.3)
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tag-release
+  cancel-in-progress: false
+
+env:
+  GOFLAGS: -mod=readonly
+
+jobs:
+  tag:
+    name: Create and push the release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - name: Run the test suite before tagging
+        run: go test -race ./...
+
+      - name: Compute the next version
+        id: version
+        shell: bash
+        env:
+          BUMP: ${{ inputs.bump }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          latest="$(git describe --tags --abbrev=0 --match 'v*' HEAD 2>/dev/null || echo 'v0.0.0')"
+
+          if [[ -n "$VERSION" ]]; then
+            tag="$VERSION"
+          else
+            version="${latest#v}"
+            IFS=. read -r major minor patch <<< "$version"
+            major="${major:-0}"
+            minor="${minor:-0}"
+            patch="${patch:-0}"
+            patch="${patch%%-*}"
+
+            case "$BUMP" in
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              patch) patch=$((patch + 1)) ;;
+              *) echo "::error::Unknown bump type '$BUMP'"; exit 1 ;;
+            esac
+
+            tag="v${major}.${minor}.${patch}"
+            if [[ -n "$PRERELEASE" ]]; then
+              tag="${tag}-${PRERELEASE}"
+            fi
+          fi
+
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$tag' is not a valid SemVer tag (expected vMAJOR.MINOR.PATCH[-prerelease])."
+            exit 1
+          fi
+
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "::error::Tag $tag already exists."
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "previous=$latest" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push the annotated tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "Release $tag"
+          git push origin "$tag"
+
+          {
+            echo "### Tagged $tag"
+            echo
+            echo "Previous tag: \`${{ steps.version.outputs.previous }}\`"
+            echo
+            echo "The release job below builds, tests, and publishes the GitHub release."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Publish the release
+    needs: tag
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.tag.outputs.tag }}
