@@ -63,13 +63,45 @@ jobs:
         run: go build ./...
 
       - name: Test
-        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+        run: go test -race ./...
 
       - name: Vet
         run: go vet ./...
 
       - name: Scan for vulnerabilities
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      - name: Prepare release notes
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          section="$(awk -v ver="$version" '
+            /^## \[/ {
+              if (started) exit
+              if (index($0, "## [" ver "]") == 1) started=1
+              next
+            }
+            started { print }
+          ' CHANGELOG.md)"
+
+          if [[ -n "$section" ]]; then
+            previous="$(git describe --tags --abbrev=0 "${RELEASE_TAG}^" 2>/dev/null || true)"
+            if [[ -n "$previous" ]]; then
+              compare="https://github.com/${GITHUB_REPOSITORY}/compare/${previous}...${RELEASE_TAG}"
+            else
+              compare="https://github.com/${GITHUB_REPOSITORY}/commits/${RELEASE_TAG}"
+            fi
+            {
+              printf "## What's changed\n\n"
+              printf "%s\n\n" "$section"
+              printf "**Full Changelog**: %s\n" "$compare"
+            } > release-notes.md
+            echo "has_notes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_notes=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Create the GitHub release
         shell: bash
@@ -79,7 +111,12 @@ jobs:
           set -euo pipefail
           tag="${RELEASE_TAG}"
 
-          args=(release create "$tag" --verify-tag --title "$tag" --generate-notes)
+          args=(release create "$tag" --verify-tag --title "$tag")
+          if [[ "${{ steps.notes.outputs.has_notes }}" == "true" ]]; then
+            args+=(--notes-file release-notes.md)
+          else
+            args+=(--generate-notes)
+          fi
           if [[ "$tag" == *-* ]]; then
             args+=(--prerelease)
           fi

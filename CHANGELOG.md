@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-04
+
 ### Added
 
 - Zero-temp `NewStreamWriter` for writing XLSX ZIP entries directly to HTTP
@@ -14,10 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `Workbook.Flush` and `Options.FlushEveryRows` for progressive HTTP/2 and
   chunked downloads, including `http.Flusher` integration.
 - Buffered and streamed HTTP export examples with benchmarks.
+- Runnable programs under `examples/` for basic writing/reading, streaming
+  reads, a feature-rich dashboard and an HTTP server, each with its own README.
+- `make examples` and an examples smoke-test CI job, including the HTTP server.
 
 ### Changed
 
 - Minimum supported Go version is now 1.24.
+- The coverage gate measures the root library package instead of examples and
+  the test generator.
 
 ## [0.2.0] - 2026-11-03
 
@@ -38,9 +45,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   auto-filters and row heights in the writer.
 - `gosec`, CodeQL, fuzz, coverage, openpyxl interoperability and expanded
   benchmark CI jobs.
-- Runnable programs under `examples/` for basic writing/reading, streaming
-  reads and a feature-rich dashboard, each with its own README.
-- `make examples` and an examples smoke-test CI job.
 
 ### Changed
 
