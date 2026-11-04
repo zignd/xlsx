@@ -53,20 +53,12 @@ jobs:
       - name: Test with the race detector
         if: matrix.os != 'windows-latest'
         shell: bash
-        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+        run: go test -race ./...
 
       - name: Test
         if: matrix.os == 'windows-latest'
         shell: bash
-        run: go test -covermode=atomic -coverprofile=coverage.out ./...
-
-      - name: Upload coverage
-        if: matrix.os == 'ubuntu-latest' && matrix.go == '1.26.x'
-        uses: actions/upload-artifact@v7
-        with:
-          name: coverage
-          path: coverage.out
-          if-no-files-found: error
+        run: go test ./...
 
   lint:
     name: Lint
@@ -122,7 +114,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test -covermode=atomic -coverprofile=coverage.out ./...
+          go test -covermode=atomic -coverprofile=coverage.out .
           total="$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/, "", $3); print $3}')"
           echo "Total coverage: ${total}%"
           awk -v total="$total" 'BEGIN { if (total < 70) { printf "coverage %.2f%% is below the 70%% gate\n", total; exit 1 } }'

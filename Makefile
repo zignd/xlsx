@@ -25,11 +25,11 @@ bench:
 	$(GO) test -run '^$$' -bench . -benchmem -benchtime=$(BENCHTIME) ./...
 
 cover:
-	$(GO) test -covermode=atomic -coverprofile=$(COVERAGE_FILE) ./...
+	$(GO) test -covermode=atomic -coverprofile=$(COVERAGE_FILE) .
 	$(GO) tool cover -func=$(COVERAGE_FILE)
 
 cover-check:
-	$(GO) test -covermode=atomic -coverprofile=$(COVERAGE_FILE) ./...
+	$(GO) test -covermode=atomic -coverprofile=$(COVERAGE_FILE) .
 	@total=$$($(GO) tool cover -func=$(COVERAGE_FILE) | awk '/^total:/ {gsub(/%/, "", $$3); print $$3}'); \
 	echo "Total coverage: $$total%"; \
 	awk -v total="$$total" -v min="$(COVERAGE_MIN)" 'BEGIN { if (total < min) { printf "coverage %.2f%% is below the %s%% gate\n", total, min; exit 1 } }'
