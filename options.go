@@ -1,6 +1,7 @@
 package xlsx
 
 import (
+	"archive/zip"
 	"context"
 	"fmt"
 	"io"
@@ -55,6 +56,10 @@ type Options struct {
 
 	// SharedStrings writes repeated strings through xl/sharedStrings.xml.
 	SharedStrings bool
+
+	// FlushEveryRows controls how often NewStreamWriter flushes compressed
+	// bytes to the underlying writer. Zero means only on Commit/Flush.
+	FlushEveryRows int
 
 	// MaxCellLength limits text values. Zero uses Excel's 32,767-character
 	// limit.
@@ -128,6 +133,8 @@ func (o Options) normalized() (Options, error) {
 		return Options{}, fmt.Errorf("max columns must be between 1 and %d", maxWorksheetColumns)
 	case o.MaxSheets < 0:
 		return Options{}, fmt.Errorf("max sheets must be positive")
+	case o.FlushEveryRows < 0:
+		return Options{}, fmt.Errorf("flush interval must be positive")
 	case o.Compression > CompressionBestCompression:
 		return Options{}, fmt.Errorf("unknown compression setting %d", o.Compression)
 	}
@@ -197,4 +204,31 @@ func NewWriter(w io.Writer, opts Options) (*Workbook, error) {
 		output:        w,
 		sharedStrings: newSharedStringsWriter(),
 	}, nil
+}
+
+// NewStreamWriter creates a workbook that writes the ZIP package directly to w
+// as rows are committed. It does not create temporary worksheet files.
+//
+// The caller owns w. Call Flush to push buffered compressed bytes to the
+// underlying writer, and Commit to write the ZIP central directory. Only one
+// worksheet may be open at a time: finish the current worksheet with CommitRows
+// and Commit before writing rows to another sheet.
+func NewStreamWriter(w io.Writer, opts Options) (*Workbook, error) {
+	if w == nil {
+		return nil, fmt.Errorf("output writer cannot be nil")
+	}
+	normalized, err := opts.normalized()
+	if err != nil {
+		return nil, err
+	}
+	workbook := &Workbook{
+		tempDirs:      &workbookTempDirs{},
+		options:       normalized,
+		output:        w,
+		streaming:     true,
+		sharedStrings: newSharedStringsWriter(),
+	}
+	workbook.stream = &streamState{zipWriter: zip.NewWriter(w)}
+	workbook.registerCompressor(workbook.stream.zipWriter)
+	return workbook, nil
 }

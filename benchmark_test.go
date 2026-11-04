@@ -2,6 +2,9 @@ package xlsx
 
 import (
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
@@ -283,5 +286,100 @@ func BenchmarkStyledFormulas(b *testing.B) {
 	}
 	if err := workbook.Commit(); err != nil {
 		b.Fatal(err)
+	}
+}
+
+func BenchmarkWriteModes(b *testing.B) {
+	for _, mode := range []struct {
+		name   string
+		stream bool
+	}{
+		{name: "buffered", stream: false},
+		{name: "streaming", stream: true},
+	} {
+		b.Run(mode.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				var (
+					workbook *Workbook
+					err      error
+				)
+				if mode.stream {
+					workbook, err = NewStreamWriter(io.Discard, Options{FlushEveryRows: 250})
+				} else {
+					workbook, err = NewWriter(io.Discard, Options{})
+				}
+				if err != nil {
+					b.Fatal(err)
+				}
+				sheet := workbook.AddWorksheet(&WorksheetOptions{Name: "Data"})
+				b.StartTimer()
+
+				for rowIndex := 0; rowIndex < 1_000; rowIndex++ {
+					row, err := sheet.AddRow()
+					if err != nil {
+						b.Fatal(err)
+					}
+					if err := row.Append(rowIndex, "value", 1.25); err != nil {
+						b.Fatal(err)
+					}
+				}
+				if err := sheet.CommitRows(); err != nil {
+					b.Fatal(err)
+				}
+				if err := workbook.Commit(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkHTTPExport(b *testing.B) {
+	for _, stream := range []bool{false, true} {
+		name := "buffered"
+		if stream {
+			name = "streaming"
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				recorder := httptest.NewRecorder()
+				request := httptest.NewRequest(http.MethodGet, "/export.xlsx", nil)
+				handler := func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+					var (
+						workbook *Workbook
+						err      error
+					)
+					if stream {
+						workbook, err = NewStreamWriter(w, Options{Context: r.Context(), FlushEveryRows: 250})
+					} else {
+						workbook, err = NewWriter(w, Options{Context: r.Context()})
+					}
+					if err != nil {
+						b.Fatal(err)
+					}
+					sheet := workbook.AddWorksheet(&WorksheetOptions{Name: "Data"})
+					for rowIndex := 0; rowIndex < 1_000; rowIndex++ {
+						row, err := sheet.AddRow()
+						if err != nil {
+							b.Fatal(err)
+						}
+						if err := row.Append(rowIndex, "value", 1.25); err != nil {
+							b.Fatal(err)
+						}
+					}
+					if err := sheet.CommitRows(); err != nil {
+						b.Fatal(err)
+					}
+					if err := workbook.Commit(); err != nil {
+						b.Fatal(err)
+					}
+				}
+				http.HandlerFunc(handler).ServeHTTP(recorder, request)
+			}
+		})
 	}
 }

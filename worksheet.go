@@ -1,6 +1,7 @@
 package xlsx
 
 import (
+	"archive/zip"
 	"bufio"
 	"database/sql/driver"
 	"errors"
@@ -44,6 +45,7 @@ type Worksheet struct {
 	freezeRows        int
 	freezeCols        int
 	autoFilter        string
+	unflushedRows     int
 }
 
 type hyperlink struct {
@@ -257,10 +259,80 @@ func (ws *Worksheet) ensureStarted() error {
 	if ws.err != nil {
 		return ws.err
 	}
+	if ws.workbook.streaming {
+		return ws.startStreaming()
+	}
 	if err := ws.workbook.ensureTempDirs(); err != nil {
 		return err
 	}
 	return ws.start()
+}
+
+func (ws *Worksheet) writePreamble(writer *bufio.Writer) error {
+	if _, err := writer.WriteString(worksheetStartPrefix); err != nil {
+		return err
+	}
+	if _, err := writer.WriteString(worksheetViewsXML(ws.freezeRows, ws.freezeCols)); err != nil {
+		return err
+	}
+	if _, err := writer.WriteString(`<sheetFormatPr defaultRowHeight="15"/>`); err != nil {
+		return err
+	}
+	if hasColumnWidths(ws.columns) {
+		if _, err := writer.WriteString("<cols>"); err != nil {
+			return err
+		}
+		for i, column := range ws.columns {
+			if column.Width <= 0 {
+				continue
+			}
+			if _, err := writer.WriteString(columnXML(i+1, column.Width)); err != nil {
+				return err
+			}
+		}
+		if _, err := writer.WriteString("</cols>"); err != nil {
+			return err
+		}
+	}
+	if _, err := writer.WriteString(worksheetDataStart); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (ws *Worksheet) startStreaming() error {
+	if ws.started {
+		return errors.New("can't start a worksheet more than once")
+	}
+	state := ws.workbook.stream
+	if state == nil || state.closed {
+		return errors.New("streaming writer is closed")
+	}
+	if state.openSheet != nil {
+		return fmt.Errorf("%w: worksheet %q is still open", ErrStreamingOrder, state.openSheet.name)
+	}
+
+	header := &zip.FileHeader{Name: "xl/worksheets/" + ws.fileName, Method: zip.Deflate}
+	if ws.workbook.options.Compression == CompressionStore {
+		header.Method = zip.Store
+	}
+	header.SetMode(ws.workbook.options.FileMode)
+	entry, err := state.zipWriter.CreateHeader(header)
+	if err != nil {
+		return fmt.Errorf("failed to create streaming worksheet %s: %w", ws.fileName, err)
+	}
+
+	writer := bufio.NewWriterSize(entry, ws.workbook.options.BufferSize)
+	if err := ws.writePreamble(writer); err != nil {
+		return fmt.Errorf("failed to write the streaming worksheet header: %w", err)
+	}
+
+	ws.writer = writer
+	ws.file = nil
+	ws.started = true
+	ws.filePath = ""
+	state.openSheet = ws
+	return nil
 }
 
 func (ws *Worksheet) start() error {
@@ -285,35 +357,8 @@ func (ws *Worksheet) start() error {
 		return startErr
 	}
 
-	if _, err := writer.WriteString(worksheetStartPrefix); err != nil {
+	if err := ws.writePreamble(writer); err != nil {
 		return cleanup(fmt.Errorf("failed to write the worksheet header to %s: %w", ws.filePath, err))
-	}
-	if _, err := writer.WriteString(worksheetViewsXML(ws.freezeRows, ws.freezeCols)); err != nil {
-		return cleanup(fmt.Errorf("failed to write the worksheet views to %s: %w", ws.filePath, err))
-	}
-	if _, err := writer.WriteString(`<sheetFormatPr defaultRowHeight="15"/>`); err != nil {
-		return cleanup(fmt.Errorf("failed to write the worksheet format to %s: %w", ws.filePath, err))
-	}
-
-	if hasColumnWidths(ws.columns) {
-		if _, err := writer.WriteString("<cols>"); err != nil {
-			return cleanup(fmt.Errorf("failed to write the columns to %s: %w", ws.filePath, err))
-		}
-		for i, column := range ws.columns {
-			if column.Width <= 0 {
-				continue
-			}
-			if _, err := writer.WriteString(columnXML(i+1, column.Width)); err != nil {
-				return cleanup(fmt.Errorf("failed to write a column to %s: %w", ws.filePath, err))
-			}
-		}
-		if _, err := writer.WriteString("</cols>"); err != nil {
-			return cleanup(fmt.Errorf("failed to finish the columns in %s: %w", ws.filePath, err))
-		}
-	}
-
-	if _, err := writer.WriteString(worksheetDataStart); err != nil {
-		return cleanup(fmt.Errorf("failed to write the worksheet data header to %s: %w", ws.filePath, err))
 	}
 
 	ws.file = f
@@ -520,8 +565,20 @@ func (ws *Worksheet) CommitRows() error {
 		return fmt.Errorf("failed to flush the worksheet: %w", err)
 	}
 
+	committedRows := len(ws.pendingRows)
 	ws.pendingRows = nil
 	ws.rowsCommittedOnce = true
+
+	if ws.workbook.streaming {
+		ws.unflushedRows += committedRows
+		interval := ws.workbook.options.FlushEveryRows
+		if interval > 0 && ws.unflushedRows >= interval {
+			if err := ws.workbook.Flush(); err != nil {
+				return err
+			}
+			ws.unflushedRows = 0
+		}
+	}
 	return nil
 }
 
@@ -544,7 +601,7 @@ func (ws *Worksheet) Commit() error {
 	if err := ws.ensureStarted(); err != nil {
 		return fmt.Errorf("failed to start the worksheet: %w", err)
 	}
-	if ws.writer == nil || ws.file == nil {
+	if ws.writer == nil || (!ws.workbook.streaming && ws.file == nil) {
 		return errors.New("the worksheet writer is not available")
 	}
 
@@ -566,8 +623,14 @@ func (ws *Worksheet) Commit() error {
 	if err := ws.writer.Flush(); err != nil {
 		return fmt.Errorf("failed to flush the worksheet: %w", err)
 	}
-	if err := ws.file.Close(); err != nil {
-		return fmt.Errorf("failed to close %s: %w", ws.filePath, err)
+	if ws.workbook.streaming {
+		if ws.workbook.stream != nil && ws.workbook.stream.openSheet == ws {
+			ws.workbook.stream.openSheet = nil
+		}
+	} else {
+		if err := ws.file.Close(); err != nil {
+			return fmt.Errorf("failed to close %s: %w", ws.filePath, err)
+		}
 	}
 
 	if err := ws.writeWorksheetRelationships(); err != nil {
@@ -596,6 +659,9 @@ func (ws *Worksheet) writeWorksheetRelationships() error {
 	b.WriteString(worksheetRelsEnd)
 
 	filePath := filepath.Join(ws.workbook.tempDirs.xlWorksheetRels, ws.fileName+".rels")
+	if ws.workbook.streaming {
+		return ws.workbook.writeStreamPart("xl/worksheets/_rels/"+ws.fileName+".rels", b.String())
+	}
 	if err := os.WriteFile(filePath, []byte(b.String()), ws.workbook.options.FileMode); err != nil {
 		return fmt.Errorf("failed to write worksheet relationships to %s: %w", filePath, err)
 	}

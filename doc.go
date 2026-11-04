@@ -66,6 +66,12 @@
 // [NewWriter] writes the final package to an io.Writer, which is useful for
 // HTTP responses and object storage.
 //
+// [NewStreamWriter] is a zero-temp streaming mode: worksheet XML and ZIP entries
+// are written directly to the io.Writer as rows are committed. Call
+// [Workbook.Flush] to push buffered bytes to an http.Flusher and
+// [Workbook.Commit] to finish the ZIP central directory. Only one worksheet may
+// be open at a time in streaming mode.
+//
 // # Values
 //
 // [Cell.Value] accepts strings, booleans, all integer and unsigned integer

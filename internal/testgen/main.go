@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/zignd/xlsx"
@@ -13,12 +14,27 @@ import (
 
 func main() {
 	output := flag.String("out", "", "output .xlsx path")
+	stream := flag.Bool("stream", false, "use the zero-temp streaming writer")
 	flag.Parse()
 	if *output == "" {
 		log.Fatal("-out is required")
 	}
 
-	workbook, err := xlsx.NewWorkbookWithOptions(*output, xlsx.Options{SharedStrings: true})
+	options := xlsx.Options{SharedStrings: true}
+	var (
+		workbook *xlsx.Workbook
+		file     *os.File
+		err      error
+	)
+	if *stream {
+		file, err = os.Create(*output)
+		if err != nil {
+			log.Fatal(err)
+		}
+		workbook, err = xlsx.NewStreamWriter(file, options)
+	} else {
+		workbook, err = xlsx.NewWorkbookWithOptions(*output, options)
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -71,6 +87,9 @@ func main() {
 	if err := data.MergeCells("A4:B4"); err != nil {
 		log.Fatal(err)
 	}
+	if err := data.Commit(); err != nil {
+		log.Fatal(err)
+	}
 
 	summary := workbook.AddWorksheet(&xlsx.WorksheetOptions{Name: "Summary"})
 	row, err := summary.AddRow()
@@ -88,6 +107,11 @@ func main() {
 
 	if err := workbook.Commit(); err != nil {
 		log.Fatal(err)
+	}
+	if file != nil {
+		if err := file.Close(); err != nil {
+			log.Fatal(err)
+		}
 	}
 	if err := xlsx.Validate(*output); err != nil {
 		log.Fatal(err)

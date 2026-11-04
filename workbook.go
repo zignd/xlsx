@@ -30,6 +30,14 @@ type Workbook struct {
 	output          io.Writer
 	sharedStrings   *sharedStringsWriter
 	styles          []Style
+	streaming       bool
+	stream          *streamState
+}
+
+type streamState struct {
+	zipWriter *zip.Writer
+	openSheet *Worksheet
+	closed    bool
 }
 
 // WorksheetOptions has options used when creating a new worksheet.
@@ -301,6 +309,9 @@ func (wb *Workbook) Commit() error {
 	if err := wb.checkContext(); err != nil {
 		return err
 	}
+	if wb.streaming {
+		return wb.finishStreaming()
+	}
 	if err := wb.ensureTempDirs(); err != nil {
 		return fmt.Errorf("failed to create the temporary directories: %w", err)
 	}
@@ -317,6 +328,107 @@ func (wb *Workbook) Commit() error {
 
 	wb.committed = true
 	_ = wb.Cleanup()
+	return nil
+}
+
+func (wb *Workbook) finishStreaming() error {
+	if wb.stream == nil {
+		return errors.New("streaming state is not initialized")
+	}
+	if wb.stream.closed {
+		return errors.New("streaming writer is already closed")
+	}
+	if wb.stream.openSheet != nil {
+		return fmt.Errorf("%w: worksheet %q is still open", ErrStreamingOrder, wb.stream.openSheet.name)
+	}
+
+	parts := []struct {
+		name    string
+		content string
+	}{
+		{"[Content_Types].xml", wb.contentTypes()},
+		{"_rels/.rels", rootRelationships},
+		{"xl/workbook.xml", wb.workbookXML()},
+		{"xl/_rels/workbook.xml.rels", wb.workbookRelationships()},
+		{"xl/styles.xml", wb.stylesXML()},
+	}
+	if wb.options.SharedStrings && wb.sharedStrings.uniqueCount() > 0 {
+		parts = append(parts, struct {
+			name    string
+			content string
+		}{"xl/sharedStrings.xml", wb.sharedStrings.xml()})
+	}
+
+	for _, part := range parts {
+		if err := wb.writeStreamPart(part.name, part.content); err != nil {
+			return err
+		}
+	}
+	if err := wb.stream.zipWriter.Close(); err != nil {
+		return fmt.Errorf("failed to close the streaming zip writer: %w", err)
+	}
+	wb.stream.closed = true
+	wb.committed = true
+	wb.cleaned = true
+	return nil
+}
+
+func (wb *Workbook) writeStreamPart(name, content string) error {
+	if wb.stream == nil || wb.stream.closed {
+		return errors.New("streaming writer is closed")
+	}
+	if wb.stream.openSheet != nil {
+		return fmt.Errorf("%w: worksheet %q is still open", ErrStreamingOrder, wb.stream.openSheet.name)
+	}
+	header := &zip.FileHeader{Name: name, Method: zip.Deflate}
+	if wb.options.Compression == CompressionStore {
+		header.Method = zip.Store
+	}
+	header.SetMode(wb.options.FileMode)
+	writer, err := wb.stream.zipWriter.CreateHeader(header)
+	if err != nil {
+		return fmt.Errorf("failed to add %s to the streaming zip: %w", name, err)
+	}
+	if _, err := io.WriteString(writer, content); err != nil {
+		return fmt.Errorf("failed to write %s to the streaming zip: %w", name, err)
+	}
+	return nil
+}
+
+// Flush pushes buffered data to the underlying writer. For a streaming writer
+// it also calls Flush on the underlying writer when it implements
+// interface{ Flush() }, which makes it useful with http.Flusher.
+func (wb *Workbook) Flush() error {
+	if err := wb.checkContext(); err != nil {
+		return err
+	}
+	if wb.streaming {
+		if wb.stream == nil || wb.stream.closed {
+			return nil
+		}
+		if wb.stream.openSheet != nil && wb.stream.openSheet.writer != nil {
+			if err := wb.stream.openSheet.writer.Flush(); err != nil {
+				return fmt.Errorf("failed to flush the worksheet: %w", err)
+			}
+		}
+		if err := wb.stream.zipWriter.Flush(); err != nil {
+			return fmt.Errorf("failed to flush the streaming zip: %w", err)
+		}
+		if wb.stream.openSheet != nil {
+			wb.stream.openSheet.unflushedRows = 0
+		}
+		if flusher, ok := wb.output.(interface{ Flush() }); ok {
+			flusher.Flush()
+		}
+		return nil
+	}
+	for _, ws := range wb.worksheets {
+		if ws.writer != nil {
+			if err := ws.writer.Flush(); err != nil {
+				return fmt.Errorf("failed to flush worksheet %q: %w", ws.name, err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -467,6 +579,14 @@ func (wb *Workbook) Cleanup() error {
 		if wb.tempDirsCreated && !ws.committed {
 			ws.err = errors.New("worksheet was cleaned up before it was committed")
 		}
+	}
+	if wb.streaming {
+		if wb.stream != nil && !wb.stream.closed {
+			_ = wb.stream.zipWriter.Close()
+			wb.stream.closed = true
+		}
+		wb.cleaned = true
+		return nil
 	}
 	if !wb.tempDirsCreated {
 		return nil

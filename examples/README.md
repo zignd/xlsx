@@ -20,6 +20,7 @@ run without a separate `go.mod` or `replace` directive.
 | [`basic`](basic) | Writing and reading a small keyed workbook with strings, numbers, booleans, floats and dates. |
 | [`read`](read) | Validating and streaming an existing workbook without loading a whole sheet into memory. |
 | [`complex`](complex) | A larger workbook with multiple sheets, styles, formulas, merged cells, hyperlinks, freeze panes, auto-filters, shared strings and batched streaming writes. |
+| [`http`](http) | An HTTP server serving the same workbook through the temp-file-backed writer and the zero-temp streaming writer. |
 
 ## Quick start
 
@@ -32,6 +33,11 @@ go run ./examples/read -in /tmp/people.xlsx
 
 # 3. Generate the feature-rich example.
 go run ./examples/complex -out /tmp/dashboard.xlsx -rows 10000
+
+# 4. Serve buffered and streamed downloads over HTTP.
+go run ./examples/http -addr 127.0.0.1:8080 -rows 10000
+curl -o /tmp/buffered.xlsx http://127.0.0.1:8080/buffered.xlsx
+curl -o /tmp/streamed.xlsx http://127.0.0.1:8080/streamed.xlsx
 ```
 
 Each example writes or reads `.xlsx` files only when you run it. Generated files

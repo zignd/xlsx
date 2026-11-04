@@ -13,7 +13,7 @@ direction needs to hold a whole workbook in memory.
 ## Features
 
 - Streaming writer with configurable batching, temp directory, buffer size and
-  ZIP compression.
+  ZIP compression, plus a zero-temp streaming mode for HTTP and pipes.
 - Streaming reader with row-bounded memory and in-memory, disk-backed or
   automatic shared-string storage.
 - Keyed columns, typed cell helpers, formulas, styles, hyperlinks, merged cells,
@@ -47,6 +47,9 @@ go run ./examples/read -in /tmp/people.xlsx
 
 # A feature-rich dashboard with styles, formulas, merges and 10k rows.
 go run ./examples/complex -out /tmp/dashboard.xlsx -rows 10000
+
+# Serve buffered and zero-temp streamed downloads.
+go run ./examples/http -addr 127.0.0.1:8080
 ```
 
 The `Example*` functions in the root tests are documentation examples for
@@ -251,8 +254,9 @@ workbook, err := xlsx.NewWorkbookWithOptions("report.xlsx", xlsx.Options{
 	Compression:   xlsx.CompressionBestSpeed,
 	TempDirMode:   0o700,
 	FileMode:      0o600,
-	SharedStrings: true,
-	Context:       ctx,
+	SharedStrings:  true,
+	FlushEveryRows: 1000, // streaming writer flush cadence
+	Context:        ctx,
 })
 ```
 
@@ -260,7 +264,95 @@ workbook, err := xlsx.NewWorkbookWithOptions("report.xlsx", xlsx.Options{
   `xlsx-*` subdirectory inside it and never deletes the parent directory.
 - `KeepTempFiles` leaves the private directory in place for debugging.
 - `NewWriter(io.Writer, Options)` writes the final ZIP to an arbitrary writer.
+- `NewStreamWriter(io.Writer, Options)` writes ZIP entries directly to the
+  writer without temporary worksheet files. See [Streaming over HTTP](#streaming-over-http).
+- `Workbook.Flush` flushes buffered data and calls the underlying writer's
+  `Flush` method when it has one, which works with `http.Flusher`.
+- `Options.FlushEveryRows` sets how often the streaming writer flushes
+  compressed bytes to the underlying writer.
 - `Workbook.Close`/`Cleanup` are idempotent and safe to `defer`.
+
+## Streaming over HTTP
+
+There are two options for serving an XLSX download.
+
+### Temp-file-backed writer
+
+`NewWriter` writes worksheets to temporary files and streams the completed ZIP
+to the response when `Commit` runs:
+
+```go
+func export(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+	w.Header().Set("Content-Disposition", `attachment; filename="report.xlsx"`)
+
+	workbook, err := xlsx.NewWriter(w, xlsx.Options{
+		Context: r.Context(),
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	sheet := workbook.AddWorksheet(&xlsx.WorksheetOptions{Name: "Data"})
+	// ... add rows and CommitRows ...
+	if err := workbook.Commit(); err != nil {
+		// Headers are already sent; the connection must be aborted.
+		return
+	}
+}
+```
+
+This is the safest option: it uses local temp disk, but generation errors before
+`Commit` can still be reported with a proper HTTP status.
+
+### Zero-temp streaming writer
+
+`NewStreamWriter` writes worksheet XML and ZIP entries directly to the response
+as rows are committed. It never creates temporary worksheet files:
+
+```go
+workbook, err := xlsx.NewStreamWriter(w, xlsx.Options{
+	Context:        r.Context(),
+	FlushEveryRows: 1000,
+	SharedStrings:  true,
+})
+if err != nil {
+	http.Error(w, err.Error(), http.StatusInternalServerError)
+	return
+}
+
+sheet := workbook.AddWorksheet(&xlsx.WorksheetOptions{Name: "Data"})
+// ... add rows and CommitRows ...
+if err := workbook.Flush(); err != nil {
+	return
+}
+if err := workbook.Commit(); err != nil {
+	// The response has already started; it will be truncated.
+	return
+}
+```
+
+Important constraints:
+
+- Only one worksheet may be open at a time. Finish a worksheet with `Commit`
+  before writing rows to another sheet.
+- The ZIP is not complete until `Commit` writes the central directory. Clients
+  can download progressively, but readers cannot fully open the file until the
+  response ends.
+- Do not set `Content-Length`; use chunked transfer or HTTP/2.
+- A failure after the first byte cannot change the HTTP status. The client gets
+  a truncated download.
+- `FlushEveryRows` controls how often compressed bytes are pushed to the
+  response. `Workbook.Flush` also calls `http.Flusher` when available.
+- For reverse proxies, disable response buffering (for example nginx
+  `X-Accel-Buffering: no`).
+- For object storage, use the provider's multipart/streaming upload API; a ZIP
+  cannot be retried with range requests while it is being generated.
+- `SharedStrings` stays in memory in streaming mode. Disable it when memory is
+  tighter than CPU/network budget.
+
+See [`examples/http`](examples/http) for a runnable server exposing both modes.
 
 ## Supported values
 
@@ -314,10 +406,12 @@ Excel, LibreOffice, openpyxl and Excelize and update the compatibility tests.
 func NewWorkbook(filePath string) *Workbook
 func NewWorkbookWithOptions(filePath string, opts Options) (*Workbook, error)
 func NewWriter(w io.Writer, opts Options) (*Workbook, error)
+func NewStreamWriter(w io.Writer, opts Options) (*Workbook, error)
 
 func (wb *Workbook) AddWorksheet(opts *WorksheetOptions) *Worksheet
 func (wb *Workbook) AddStyle(style Style) (int, error)
 func (wb *Workbook) Commit() error
+func (wb *Workbook) Flush() error
 func (wb *Workbook) Close() error
 func (wb *Workbook) Cleanup() error
 func (wb *Workbook) TempDir() string
@@ -369,9 +463,10 @@ go test -run '^$' -bench . -benchmem ./...
 ```
 
 The suite covers typed writes, shared strings, styles, row buffering,
-`CommitRows`, full workbook commits, reading, validation and XML escaping.
-Results depend on the machine and storage; CI runs a smoke test for every
-benchmark.
+`CommitRows`, full workbook commits, reading, validation, XML escaping and a
+side-by-side comparison of buffered and streaming HTTP exports
+(`BenchmarkWriteModes` and `BenchmarkHTTPExport`). Results depend on the machine
+and storage; CI runs a smoke test for every benchmark.
 
 ## Performance guide
 
@@ -410,7 +505,7 @@ make test-race   # race detector
 make cover       # coverage profile + function report
 make cover-check # coverage gate
 make interop     # openpyxl interoperability check
-make examples    # run all runnable examples
+make examples    # run the file-based examples
 make bench       # benchmarks
 make lint        # golangci-lint
 make check       # tidy + format + vet + race tests + lint

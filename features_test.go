@@ -501,6 +501,7 @@ func TestOptionsValidation(t *testing.T) {
 		"negative cell length": {MaxCellLength: -1},
 		"too many rows":        {MaxRows: maxWorksheetRows + 1},
 		"too many columns":     {MaxColumns: maxWorksheetColumns + 1},
+		"negative flush":       {FlushEveryRows: -1},
 		"unknown compression":  {Compression: 99},
 	} {
 		t.Run(name, func(t *testing.T) {

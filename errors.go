@@ -91,4 +91,8 @@ var (
 	// ErrWrongCellType is returned when a typed cell accessor is used on the
 	// wrong cell type.
 	ErrWrongCellType = errors.New("wrong cell type")
+
+	// ErrStreamingOrder is returned when a streaming writer is asked to
+	// interleave multiple open worksheets.
+	ErrStreamingOrder = errors.New("streaming writer requires one worksheet at a time")
 )

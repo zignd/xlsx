@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Zero-temp `NewStreamWriter` for writing XLSX ZIP entries directly to HTTP
+  responses, pipes, SFTP and other `io.Writer` targets.
+- `Workbook.Flush` and `Options.FlushEveryRows` for progressive HTTP/2 and
+  chunked downloads, including `http.Flusher` integration.
+- Buffered and streamed HTTP export examples with benchmarks.
+
+### Changed
+
+- Minimum supported Go version is now 1.24.
+
 ## [0.2.0] - 2026-11-03
 
 ### Added

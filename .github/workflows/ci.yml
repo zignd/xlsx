@@ -142,11 +142,15 @@ jobs:
       - name: Install openpyxl
         run: python3 -m pip install --user --disable-pip-version-check openpyxl
 
-      - name: Generate a conformance workbook
-        run: go run ./internal/testgen -out "$RUNNER_TEMP/conformance.xlsx"
+      - name: Generate conformance workbooks
+        run: |
+          go run ./internal/testgen -out "$RUNNER_TEMP/conformance.xlsx"
+          go run ./internal/testgen -out "$RUNNER_TEMP/conformance-stream.xlsx" -stream
 
-      - name: Read the workbook with openpyxl
-        run: python3 scripts/check_openpyxl.py "$RUNNER_TEMP/conformance.xlsx"
+      - name: Read both workbooks with openpyxl
+        run: |
+          python3 scripts/check_openpyxl.py "$RUNNER_TEMP/conformance.xlsx"
+          python3 scripts/check_openpyxl.py "$RUNNER_TEMP/conformance-stream.xlsx"
 
   fuzz:
     name: Fuzz smoke test
@@ -205,6 +209,24 @@ jobs:
           go run ./examples/basic -out "$out/basic.xlsx"
           go run ./examples/read -in "$out/basic.xlsx" -max-rows 3
           go run ./examples/complex -out "$out/complex.xlsx" -rows 2000
+
+      - name: Smoke test the HTTP example
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./examples/http -addr 127.0.0.1:18080 -rows 100 >"$RUNNER_TEMP/http.log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/ >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS -o "$RUNNER_TEMP/buffered.xlsx" http://127.0.0.1:18080/buffered.xlsx
+          curl -fsS -o "$RUNNER_TEMP/streamed.xlsx" http://127.0.0.1:18080/streamed.xlsx
+          unzip -t "$RUNNER_TEMP/buffered.xlsx" >/dev/null
+          unzip -t "$RUNNER_TEMP/streamed.xlsx" >/dev/null
 
   benchmarks:
     name: Benchmark smoke test
