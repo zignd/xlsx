@@ -2,6 +2,8 @@ package xlsx
 
 import (
 	"archive/zip"
+	"compress/flate"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +26,10 @@ type Workbook struct {
 	relationships   []*relationship
 	committed       bool
 	cleaned         bool
+	options         Options
+	output          io.Writer
+	sharedStrings   *sharedStringsWriter
+	styles          []Style
 }
 
 // WorksheetOptions has options used when creating a new worksheet.
@@ -33,10 +39,11 @@ type WorksheetOptions struct {
 }
 
 type workbookTempDirs struct {
-	rels         string
-	xl           string
-	xlRels       string
-	xlWorksheets string
+	rels            string
+	xl              string
+	xlRels          string
+	xlWorksheets    string
+	xlWorksheetRels string
 }
 
 type relationship struct {
@@ -52,6 +59,22 @@ type relationship struct {
 func (wb *Workbook) AddWorksheet(opts *WorksheetOptions) *Worksheet {
 	if opts == nil {
 		opts = &WorksheetOptions{}
+	}
+
+	if err := wb.checkContext(); err != nil {
+		return &Worksheet{workbook: wb, err: err}
+	}
+	if len(wb.worksheets) >= wb.options.MaxSheets {
+		id := len(wb.worksheets) + 1
+		ws := &Worksheet{
+			workbook: wb,
+			id:       id,
+			name:     opts.Name,
+			fileName: fmt.Sprintf("sheet%d.xml", id),
+			err:      fmt.Errorf("%w: maximum is %d", ErrTooManySheets, wb.options.MaxSheets),
+		}
+		wb.worksheets = append(wb.worksheets, ws)
+		return ws
 	}
 
 	id := len(wb.worksheets) + 1
@@ -102,6 +125,30 @@ func (wb *Workbook) HasPendingWorksheets() bool {
 	return false
 }
 
+// TempDir returns the current private temporary directory, or an empty string
+// before temporary files have been created.
+func (wb *Workbook) TempDir() string {
+	return wb.tempRootDir
+}
+
+// Context returns the writer context.
+func (wb *Workbook) Context() context.Context {
+	return wb.options.Context
+}
+
+func (wb *Workbook) checkContext() error {
+	if wb.options.Context == nil {
+		return nil
+	}
+	return wb.options.Context.Err()
+}
+
+// Close releases temporary resources. It is an idempotent alias for Cleanup and
+// is intended for defer use.
+func (wb *Workbook) Close() error {
+	return wb.Cleanup()
+}
+
 func (wb *Workbook) ensureTempDirs() error {
 	if wb.tempDirsCreated {
 		return nil
@@ -117,9 +164,13 @@ func (wb *Workbook) createTempDirs() error {
 		wb.tempDirs = &workbookTempDirs{}
 	}
 
-	tempRootDir, err := os.MkdirTemp("", "xlsx-*")
+	tempRootDir, err := os.MkdirTemp(wb.options.TempDir, "xlsx-*")
 	if err != nil {
 		return fmt.Errorf("failed to create a temporary directory for the workbook files: %w", err)
+	}
+	if err := os.Chmod(tempRootDir, wb.options.TempDirMode); err != nil {
+		_ = os.RemoveAll(tempRootDir)
+		return fmt.Errorf("failed to secure temporary directory %s: %w", tempRootDir, err)
 	}
 
 	dirs := []struct {
@@ -130,10 +181,11 @@ func (wb *Workbook) createTempDirs() error {
 		{filepath.Join(tempRootDir, "xl"), &wb.tempDirs.xl},
 		{filepath.Join(tempRootDir, "xl", "_rels"), &wb.tempDirs.xlRels},
 		{filepath.Join(tempRootDir, "xl", "worksheets"), &wb.tempDirs.xlWorksheets},
+		{filepath.Join(tempRootDir, "xl", "worksheets", "_rels"), &wb.tempDirs.xlWorksheetRels},
 	}
 
 	for _, dir := range dirs {
-		if err := os.MkdirAll(dir.path, 0o755); err != nil {
+		if err := os.MkdirAll(dir.path, wb.options.TempDirMode); err != nil {
 			_ = os.RemoveAll(tempRootDir)
 			return fmt.Errorf("failed to create temporary directory %q: %w", dir.path, err)
 		}
@@ -153,6 +205,9 @@ func (wb *Workbook) contentTypes() string {
 		b.WriteString(contentTypeOverride("/xl/worksheets/"+ws.fileName, contentTypeWorksheet))
 	}
 	b.WriteString(contentTypeOverride("/xl/styles.xml", contentTypeStyles))
+	if wb.options.SharedStrings && wb.sharedStrings.uniqueCount() > 0 {
+		b.WriteString(contentTypeOverride("/xl/sharedStrings.xml", contentTypeSharedStrings))
+	}
 	b.WriteString(contentTypesEnd)
 	return b.String()
 }
@@ -173,7 +228,12 @@ func (wb *Workbook) workbookRelationships() string {
 	for i, rel := range wb.relationships {
 		b.WriteString(relationshipXML(i+1, rel.relType, rel.target))
 	}
-	b.WriteString(relationshipXML(len(wb.relationships)+1, contentTypeStylesR, "styles.xml"))
+	nextID := len(wb.relationships) + 1
+	b.WriteString(relationshipXML(nextID, contentTypeStylesR, "styles.xml"))
+	nextID++
+	if wb.options.SharedStrings && wb.sharedStrings.uniqueCount() > 0 {
+		b.WriteString(relationshipXML(nextID, relationshipSharedStrings, "sharedStrings.xml"))
+	}
 	b.WriteString(workbookRelsEnd)
 	return b.String()
 }
@@ -187,11 +247,17 @@ func (wb *Workbook) createMetadataFiles() error {
 		{filepath.Join(wb.tempDirs.rels, ".rels"), rootRelationships},
 		{filepath.Join(wb.tempDirs.xl, "workbook.xml"), wb.workbookXML()},
 		{filepath.Join(wb.tempDirs.xlRels, "workbook.xml.rels"), wb.workbookRelationships()},
-		{filepath.Join(wb.tempDirs.xl, "styles.xml"), stylesXML},
+		{filepath.Join(wb.tempDirs.xl, "styles.xml"), wb.stylesXML()},
+	}
+	if wb.options.SharedStrings && wb.sharedStrings.uniqueCount() > 0 {
+		files = append(files, struct {
+			path    string
+			content string
+		}{filepath.Join(wb.tempDirs.xl, "sharedStrings.xml"), wb.sharedStrings.xml()})
 	}
 
 	for _, file := range files {
-		if err := os.WriteFile(file.path, []byte(file.content), 0o644); err != nil {
+		if err := os.WriteFile(file.path, []byte(file.content), wb.options.FileMode); err != nil {
 			return fmt.Errorf("failed to write %s: %w", file.path, err)
 		}
 	}
@@ -201,6 +267,9 @@ func (wb *Workbook) createMetadataFiles() error {
 // Commit commits the workbook, persisting the data to the file path supplied to
 // NewWorkbook. Worksheets with no pending rows are finalized automatically.
 func (wb *Workbook) Commit() error {
+	if err := wb.checkContext(); err != nil {
+		return err
+	}
 	if wb.committed {
 		return fmt.Errorf("%w: can't commit it twice", ErrWorkbookCommitted)
 	}
@@ -210,7 +279,7 @@ func (wb *Workbook) Commit() error {
 	if len(wb.worksheets) == 0 {
 		return ErrNoWorksheets
 	}
-	if wb.FilePath == "" {
+	if wb.output == nil && wb.FilePath == "" {
 		return errors.New("the workbook file path cannot be empty")
 	}
 
@@ -229,13 +298,20 @@ func (wb *Workbook) Commit() error {
 		}
 	}
 
+	if err := wb.checkContext(); err != nil {
+		return err
+	}
 	if err := wb.ensureTempDirs(); err != nil {
 		return fmt.Errorf("failed to create the temporary directories: %w", err)
 	}
 	if err := wb.createMetadataFiles(); err != nil {
 		return err
 	}
-	if err := wb.writeFile(); err != nil {
+	if wb.output != nil {
+		if err := wb.writeTo(wb.output); err != nil {
+			return err
+		}
+	} else if err := wb.writeFile(); err != nil {
 		return err
 	}
 
@@ -244,9 +320,35 @@ func (wb *Workbook) Commit() error {
 	return nil
 }
 
+func (wb *Workbook) writeTo(w io.Writer) error {
+	zw := zip.NewWriter(w)
+	wb.registerCompressor(zw)
+	if err := wb.addFilesToZip(zw); err != nil {
+		_ = zw.Close()
+		return err
+	}
+	if err := zw.Close(); err != nil {
+		return fmt.Errorf("failed to close the zip writer: %w", err)
+	}
+	return nil
+}
+
+func (wb *Workbook) registerCompressor(zw *zip.Writer) {
+	switch wb.options.Compression {
+	case CompressionBestSpeed:
+		zw.RegisterCompressor(zip.Deflate, func(out io.Writer) (io.WriteCloser, error) {
+			return flate.NewWriter(out, flate.BestSpeed)
+		})
+	case CompressionBestCompression:
+		zw.RegisterCompressor(zip.Deflate, func(out io.Writer) (io.WriteCloser, error) {
+			return flate.NewWriter(out, flate.BestCompression)
+		})
+	}
+}
+
 func (wb *Workbook) writeFile() error {
 	dir := filepath.Dir(wb.FilePath)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return fmt.Errorf("failed to create the output directory %s: %w", dir, err)
 	}
 	if info, statErr := os.Stat(wb.FilePath); statErr == nil && info.IsDir() {
@@ -265,15 +367,9 @@ func (wb *Workbook) writeFile() error {
 		}
 	}()
 
-	zw := zip.NewWriter(tmp)
-	if err := wb.addFilesToZip(zw); err != nil {
-		_ = zw.Close()
+	if err := wb.writeTo(tmp); err != nil {
 		_ = tmp.Close()
 		return err
-	}
-	if err := zw.Close(); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("failed to close the zip writer: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
@@ -282,7 +378,7 @@ func (wb *Workbook) writeFile() error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("failed to close the output file: %w", err)
 	}
-	if err := os.Chmod(tmpPath, 0o644); err != nil {
+	if err := os.Chmod(tmpPath, wb.options.FileMode); err != nil {
 		return fmt.Errorf("failed to set permissions on the output file: %w", err)
 	}
 
@@ -336,13 +432,17 @@ func (wb *Workbook) addFilesToZip(zw *zip.Writer) error {
 			return fmt.Errorf("failed to create a zip header for %s: %w", path, err)
 		}
 		header.Name = filepath.ToSlash(relativePath)
-		header.Method = zip.Deflate
+		if wb.options.Compression == CompressionStore {
+			header.Method = zip.Store
+		} else {
+			header.Method = zip.Deflate
+		}
 
 		writer, err := zw.CreateHeader(header)
 		if err != nil {
 			return fmt.Errorf("failed to add %s to the zip file: %w", relativePath, err)
 		}
-		f, err := os.Open(path)
+		f, err := os.Open(path) // #nosec G304 -- path is inside the managed temporary directory.
 		if err != nil {
 			return fmt.Errorf("failed to open %s: %w", path, err)
 		}
@@ -369,6 +469,12 @@ func (wb *Workbook) Cleanup() error {
 		}
 	}
 	if !wb.tempDirsCreated {
+		return nil
+	}
+
+	if wb.options.KeepTempFiles {
+		wb.tempDirsCreated = false
+		wb.cleaned = true
 		return nil
 	}
 

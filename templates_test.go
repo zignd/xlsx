@@ -50,32 +50,32 @@ func TestCellFormats(t *testing.T) {
 	}{
 		{
 			name: "text escapes XML",
-			got:  textCellXML("A1", `a & b <c>`),
+			got:  textCellXML("A1", `a & b <c>`, 0),
 			want: `<c r="A1" t="inlineStr"><is><t xml:space="preserve">a &amp; b &lt;c&gt;</t></is></c>`,
 		},
 		{
 			name: "number",
-			got:  numberCellXML("B2", "42.5"),
+			got:  numberCellXML("B2", "42.5", 0),
 			want: `<c r="B2" t="n"><v>42.5</v></c>`,
 		},
 		{
 			name: "bool true",
-			got:  boolCellXML("C3", true),
+			got:  boolCellXML("C3", true, 0),
 			want: `<c r="C3" t="b"><v>1</v></c>`,
 		},
 		{
 			name: "bool false",
-			got:  boolCellXML("C3", false),
+			got:  boolCellXML("C3", false, 0),
 			want: `<c r="C3" t="b"><v>0</v></c>`,
 		},
 		{
 			name: "blank",
-			got:  blankCellXML("D4"),
+			got:  blankCellXML("D4", 0),
 			want: `<c r="D4"/>`,
 		},
 		{
 			name: "date",
-			got:  dateCellXML("E5", time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)),
+			got:  dateCellXML("E5", time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC), 0),
 			want: `<c r="E5" s="1" t="n"><v>25569</v></c>`,
 		},
 	}

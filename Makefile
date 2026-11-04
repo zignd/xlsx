@@ -5,9 +5,10 @@
 
 GO ?= go
 COVERAGE_FILE ?= coverage.out
+COVERAGE_MIN ?= 70
 BENCHTIME ?= 1s
 
-.PHONY: all build test test-race bench cover lint vet fmt tidy check clean
+.PHONY: all build test test-race bench cover cover-check interop lint vet fmt tidy check clean
 
 all: check
 
@@ -26,6 +27,18 @@ bench:
 cover:
 	$(GO) test -covermode=atomic -coverprofile=$(COVERAGE_FILE) ./...
 	$(GO) tool cover -func=$(COVERAGE_FILE)
+
+cover-check:
+	$(GO) test -covermode=atomic -coverprofile=$(COVERAGE_FILE) ./...
+	@total=$$($(GO) tool cover -func=$(COVERAGE_FILE) | awk '/^total:/ {gsub(/%/, "", $$3); print $$3}'); \
+	echo "Total coverage: $$total%"; \
+	awk -v total="$$total" -v min="$(COVERAGE_MIN)" 'BEGIN { if (total < min) { printf "coverage %.2f%% is below the %s%% gate\n", total, min; exit 1 } }'
+
+interop:
+	@tmp=$$(mktemp -d); \
+	$(GO) run ./internal/testgen -out $$tmp/conformance.xlsx; \
+	python3 scripts/check_openpyxl.py $$tmp/conformance.xlsx; \
+	rm -rf $$tmp
 
 lint:
 	golangci-lint run

@@ -105,6 +105,92 @@ jobs:
           go mod tidy
           git diff --exit-code -- go.mod go.sum
 
+  coverage:
+    name: Coverage gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - name: Measure coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -covermode=atomic -coverprofile=coverage.out ./...
+          total="$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/, "", $3); print $3}')"
+          echo "Total coverage: ${total}%"
+          awk -v total="$total" 'BEGIN { if (total < 70) { printf "coverage %.2f%% is below the 70%% gate\n", total; exit 1 } }'
+
+      - name: Upload coverage profile
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-profile
+          path: coverage.out
+          if-no-files-found: error
+
+  interop:
+    name: Openpyxl interoperability
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - name: Install openpyxl
+        run: python3 -m pip install --user --disable-pip-version-check openpyxl
+
+      - name: Generate a conformance workbook
+        run: go run ./internal/testgen -out "$RUNNER_TEMP/conformance.xlsx"
+
+      - name: Read the workbook with openpyxl
+        run: python3 scripts/check_openpyxl.py "$RUNNER_TEMP/conformance.xlsx"
+
+  fuzz:
+    name: Fuzz smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - name: Fuzz the reader
+        run: go test -run '^$' -fuzz=FuzzReader -fuzztime=15s .
+
+      - name: Fuzz column conversion
+        run: go test -run '^$' -fuzz=FuzzNumericToLetters -fuzztime=10s .
+
+  gosec:
+    name: Security scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - name: Run gosec
+        run: go run github.com/securego/gosec/v2/cmd/gosec@latest -quiet ./...
+
   benchmarks:
     name: Benchmark smoke test
     runs-on: ubuntu-latest

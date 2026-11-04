@@ -12,13 +12,15 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
-
-const worksheetBufferSize = 64 * 1024
 
 const (
 	maxWorksheetColumns = 16_384
 	maxWorksheetRows    = 1_048_576
+	maxRowHeight        = 409
+	maxFormulaLength    = 8_192
+	maxHyperlinkLength  = 2_079
 )
 
 // Worksheet represents a worksheet in a workbook.
@@ -37,6 +39,16 @@ type Worksheet struct {
 	file              *os.File
 	writer            *bufio.Writer
 	err               error
+	hyperlinks        []hyperlink
+	mergeCells        []string
+	freezeRows        int
+	freezeCols        int
+	autoFilter        string
+}
+
+type hyperlink struct {
+	ref    string
+	target string
 }
 
 // WorksheetColumn represents a column in a worksheet.
@@ -65,9 +77,24 @@ func (ws *Worksheet) FileName() string {
 	return ws.fileName
 }
 
+func (ws *Worksheet) maxRows() int {
+	return ws.workbook.options.MaxRows
+}
+
+func (ws *Worksheet) maxColumns() int {
+	return ws.workbook.options.MaxColumns
+}
+
+func (ws *Worksheet) maxCellLength() int {
+	return ws.workbook.options.MaxCellLength
+}
+
 // DefineColumns defines the worksheet columns and writes the header row. It is
 // optional; a worksheet can be used without columns by calling AddCell.
 func (ws *Worksheet) DefineColumns(columns []*WorksheetColumn) error {
+	if err := ws.workbook.checkContext(); err != nil {
+		return err
+	}
 	if ws.err != nil {
 		return ws.err
 	}
@@ -83,8 +110,8 @@ func (ws *Worksheet) DefineColumns(columns []*WorksheetColumn) error {
 	if len(columns) == 0 {
 		return fmt.Errorf("%w: at least one column is required", ErrInvalidColumn)
 	}
-	if len(columns) > maxWorksheetColumns {
-		return fmt.Errorf("%w: a worksheet supports at most %d columns", ErrInvalidColumn, maxWorksheetColumns)
+	if len(columns) > ws.maxColumns() {
+		return fmt.Errorf("%w: a worksheet supports at most %d columns", ErrInvalidColumn, ws.maxColumns())
 	}
 
 	seen := make(map[string]struct{}, len(columns))
@@ -131,14 +158,17 @@ func (ws *Worksheet) DefineColumns(columns []*WorksheetColumn) error {
 // AddRow adds a new row to the worksheet. Rows are buffered in memory until
 // CommitRows is called.
 func (ws *Worksheet) AddRow() (*Row, error) {
+	if err := ws.workbook.checkContext(); err != nil {
+		return nil, err
+	}
 	if ws.err != nil {
 		return nil, ws.err
 	}
 	if ws.committed {
 		return nil, fmt.Errorf("%w: can't add rows", ErrWorksheetCommitted)
 	}
-	if ws.rowsCount >= maxWorksheetRows {
-		return nil, fmt.Errorf("a worksheet supports at most %d rows", maxWorksheetRows)
+	if ws.rowsCount >= ws.maxRows() {
+		return nil, fmt.Errorf("a worksheet supports at most %d rows", ws.maxRows())
 	}
 
 	row := &Row{
@@ -153,6 +183,71 @@ func (ws *Worksheet) AddRow() (*Row, error) {
 	}
 
 	return row, nil
+}
+
+// MergeCells merges one or more A1 ranges. Ranges must be valid and must not
+// overlap.
+func (ws *Worksheet) MergeCells(ranges ...string) error {
+	if ws.err != nil {
+		return ws.err
+	}
+	if ws.committed {
+		return fmt.Errorf("%w: can't merge cells", ErrWorksheetCommitted)
+	}
+
+	for _, ref := range ranges {
+		normalized, rect, err := normalizeRange(ref, ws.maxRows(), ws.maxColumns())
+		if err != nil {
+			return err
+		}
+		for _, existing := range ws.mergeCells {
+			_, existingRect, _ := normalizeRange(existing, ws.maxRows(), ws.maxColumns())
+			if rangesOverlap(rect, existingRect) {
+				return fmt.Errorf("%w: range %s overlaps %s", ErrInvalidRange, normalized, existing)
+			}
+		}
+		ws.mergeCells = append(ws.mergeCells, normalized)
+	}
+	return nil
+}
+
+// FreezePanes freezes the given number of rows and columns. It must be called
+// before any rows are committed.
+func (ws *Worksheet) FreezePanes(rows, columns int) error {
+	if ws.err != nil {
+		return ws.err
+	}
+	if ws.committed {
+		return fmt.Errorf("%w: can't freeze panes", ErrWorksheetCommitted)
+	}
+	if ws.started {
+		return errors.New("can't change freeze panes after rows have been written")
+	}
+	if rows < 0 || columns < 0 || rows > ws.maxRows() || columns > ws.maxColumns() {
+		return fmt.Errorf("%w: freeze pane counts are out of range", ErrInvalidRange)
+	}
+	if rows == 0 && columns == 0 {
+		return fmt.Errorf("%w: at least one frozen row or column is required", ErrInvalidRange)
+	}
+	ws.freezeRows = rows
+	ws.freezeCols = columns
+	return nil
+}
+
+// SetAutoFilter sets the auto-filter range for the worksheet.
+func (ws *Worksheet) SetAutoFilter(ref string) error {
+	if ws.err != nil {
+		return ws.err
+	}
+	if ws.committed {
+		return fmt.Errorf("%w: can't set an auto-filter", ErrWorksheetCommitted)
+	}
+	normalized, _, err := normalizeRange(ref, ws.maxRows(), ws.maxColumns())
+	if err != nil {
+		return err
+	}
+	ws.autoFilter = normalized
+	return nil
 }
 
 func (ws *Worksheet) ensureStarted() error {
@@ -182,7 +277,7 @@ func (ws *Worksheet) start() error {
 		return fmt.Errorf("failed to create %s: %w", ws.filePath, err)
 	}
 
-	writer := bufio.NewWriterSize(f, worksheetBufferSize)
+	writer := bufio.NewWriterSize(f, ws.workbook.options.BufferSize)
 	cleanup := func(startErr error) error {
 		_ = writer.Flush()
 		_ = f.Close()
@@ -190,8 +285,14 @@ func (ws *Worksheet) start() error {
 		return startErr
 	}
 
-	if _, err := writer.WriteString(worksheetStart); err != nil {
+	if _, err := writer.WriteString(worksheetStartPrefix); err != nil {
 		return cleanup(fmt.Errorf("failed to write the worksheet header to %s: %w", ws.filePath, err))
+	}
+	if _, err := writer.WriteString(worksheetViewsXML(ws.freezeRows, ws.freezeCols)); err != nil {
+		return cleanup(fmt.Errorf("failed to write the worksheet views to %s: %w", ws.filePath, err))
+	}
+	if _, err := writer.WriteString(`<sheetFormatPr defaultRowHeight="15"/>`); err != nil {
+		return cleanup(fmt.Errorf("failed to write the worksheet format to %s: %w", ws.filePath, err))
 	}
 
 	if hasColumnWidths(ws.columns) {
@@ -230,16 +331,53 @@ func hasColumnWidths(columns []*WorksheetColumn) bool {
 	return false
 }
 
+func (ws *Worksheet) writeStringCell(identifier, value string, styleID int) error {
+	if utf8.RuneCountInString(value) > ws.maxCellLength() {
+		return fmt.Errorf("%w: maximum is %d characters", ErrCellTooLong, ws.maxCellLength())
+	}
+	if ws.workbook.options.SharedStrings {
+		index := ws.workbook.sharedStrings.index(value)
+		_, err := ws.writer.WriteString(sharedStringCellXML(identifier, index, styleID))
+		return err
+	}
+	_, err := ws.writer.WriteString(textCellXML(identifier, value, styleID))
+	return err
+}
+
 func (ws *Worksheet) writeCell(cell *Cell) error {
+	if cell.Hyperlink != "" {
+		target, err := normalizeHyperlink(cell.Hyperlink)
+		if err != nil {
+			return err
+		}
+		ws.hyperlinks = append(ws.hyperlinks, hyperlink{ref: cell.identifier, target: target})
+	}
+
+	styleID := cell.StyleID
+	if styleID != 0 {
+		if err := ws.workbook.validateStyleID(styleID); err != nil {
+			return err
+		}
+	}
+
+	if cell.Formula != "" {
+		formula, err := normalizeFormula(cell.Formula)
+		if err != nil {
+			return err
+		}
+		_, err = ws.writer.WriteString(formulaCellXML(cell.identifier, formula, styleID))
+		return err
+	}
+
 	value := cell.Value
 	if value == nil {
-		_, err := ws.writer.WriteString(blankCellXML(cell.identifier))
+		_, err := ws.writer.WriteString(blankCellXML(cell.identifier, styleID))
 		return err
 	}
 
 	if valuer, ok := value.(driver.Valuer); ok {
 		if isNilValue(valuer) {
-			_, err := ws.writer.WriteString(blankCellXML(cell.identifier))
+			_, err := ws.writer.WriteString(blankCellXML(cell.identifier, styleID))
 			return err
 		}
 		driverValue, err := valuer.Value()
@@ -251,35 +389,32 @@ func (ws *Worksheet) writeCell(cell *Cell) error {
 
 	switch v := value.(type) {
 	case nil:
-		_, err := ws.writer.WriteString(blankCellXML(cell.identifier))
+		_, err := ws.writer.WriteString(blankCellXML(cell.identifier, styleID))
 		return err
 	case time.Time:
-		_, err := ws.writer.WriteString(dateCellXML(cell.identifier, v))
+		_, err := ws.writer.WriteString(dateCellXML(cell.identifier, v, styleID))
 		return err
 	case string:
-		_, err := ws.writer.WriteString(textCellXML(cell.identifier, v))
-		return err
+		return ws.writeStringCell(cell.identifier, v, styleID)
 	case []byte:
-		_, err := ws.writer.WriteString(textCellXML(cell.identifier, string(v)))
-		return err
+		return ws.writeStringCell(cell.identifier, string(v), styleID)
 	case bool:
-		_, err := ws.writer.WriteString(boolCellXML(cell.identifier, v))
+		_, err := ws.writer.WriteString(boolCellXML(cell.identifier, v, styleID))
 		return err
 	}
 
 	rv := reflect.ValueOf(value)
 	switch rv.Kind() {
 	case reflect.String:
-		_, err := ws.writer.WriteString(textCellXML(cell.identifier, rv.String()))
-		return err
+		return ws.writeStringCell(cell.identifier, rv.String(), styleID)
 	case reflect.Bool:
-		_, err := ws.writer.WriteString(boolCellXML(cell.identifier, rv.Bool()))
+		_, err := ws.writer.WriteString(boolCellXML(cell.identifier, rv.Bool(), styleID))
 		return err
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		_, err := ws.writer.WriteString(numberCellXML(cell.identifier, strconv.FormatInt(rv.Int(), 10)))
+		_, err := ws.writer.WriteString(numberCellXML(cell.identifier, strconv.FormatInt(rv.Int(), 10), styleID))
 		return err
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		_, err := ws.writer.WriteString(numberCellXML(cell.identifier, strconv.FormatUint(rv.Uint(), 10)))
+		_, err := ws.writer.WriteString(numberCellXML(cell.identifier, strconv.FormatUint(rv.Uint(), 10), styleID))
 		return err
 	case reflect.Float32, reflect.Float64:
 		f := rv.Float()
@@ -290,12 +425,11 @@ func (ws *Worksheet) writeCell(cell *Cell) error {
 		if rv.Kind() == reflect.Float32 {
 			formatted = formatFloat32(float32(f))
 		}
-		_, err := ws.writer.WriteString(numberCellXML(cell.identifier, formatted))
+		_, err := ws.writer.WriteString(numberCellXML(cell.identifier, formatted, styleID))
 		return err
 	case reflect.Slice:
 		if rv.Type().Elem().Kind() == reflect.Uint8 {
-			_, err := ws.writer.WriteString(textCellXML(cell.identifier, string(rv.Bytes())))
-			return err
+			return ws.writeStringCell(cell.identifier, string(rv.Bytes()), styleID)
 		}
 		return fmt.Errorf("%w: %s", ErrUnsupportedType, rv.Type().String())
 	case reflect.Struct:
@@ -316,7 +450,10 @@ func isNilValue(value interface{}) bool {
 }
 
 func (ws *Worksheet) writeRow(row *Row) error {
-	if _, err := ws.writer.WriteString(startRowXML(row.index)); err != nil {
+	if row.Height < 0 || row.Height > maxRowHeight {
+		return fmt.Errorf("%w: height must be between 0 and %d", ErrInvalidRow, maxRowHeight)
+	}
+	if _, err := ws.writer.WriteString(startRowXML(row.index, row.Height)); err != nil {
 		return err
 	}
 
@@ -330,7 +467,7 @@ func (ws *Worksheet) writeRow(row *Row) error {
 		for i, column := range ws.columns {
 			cell, ok := row.cellsMap[column.Key]
 			if !ok {
-				if _, err := ws.writer.WriteString(blankCellXML(createIdentifierFromCoords(i, row.index))); err != nil {
+				if _, err := ws.writer.WriteString(blankCellXML(createIdentifierFromCoords(i, row.index), 0)); err != nil {
 					return err
 				}
 				continue
@@ -351,6 +488,9 @@ func (ws *Worksheet) writeRow(row *Row) error {
 // CommitRows writes the rows stored in memory to disk. It can be called
 // repeatedly to stream data without keeping the whole worksheet in memory.
 func (ws *Worksheet) CommitRows() error {
+	if err := ws.workbook.checkContext(); err != nil {
+		return err
+	}
 	if ws.err != nil {
 		return ws.err
 	}
@@ -368,6 +508,9 @@ func (ws *Worksheet) CommitRows() error {
 	}
 
 	for _, row := range ws.pendingRows {
+		if err := ws.workbook.checkContext(); err != nil {
+			return err
+		}
 		if err := ws.writeRow(row); err != nil {
 			return fmt.Errorf("failed to write row %d: %w", row.index+1, err)
 		}
@@ -386,6 +529,9 @@ func (ws *Worksheet) CommitRows() error {
 // file. Workbook.Commit finalizes worksheets automatically; calling Commit on
 // an already committed worksheet returns ErrWorksheetCommitted.
 func (ws *Worksheet) Commit() error {
+	if err := ws.workbook.checkContext(); err != nil {
+		return err
+	}
 	if ws.err != nil {
 		return ws.err
 	}
@@ -405,6 +551,18 @@ func (ws *Worksheet) Commit() error {
 	if _, err := ws.writer.WriteString(worksheetDataEnd); err != nil {
 		return fmt.Errorf("failed to write the worksheet footer: %w", err)
 	}
+	if _, err := ws.writer.WriteString(autoFilterXML(ws.autoFilter)); err != nil {
+		return fmt.Errorf("failed to write the auto-filter: %w", err)
+	}
+	if _, err := ws.writer.WriteString(mergeCellsXML(ws.mergeCells)); err != nil {
+		return fmt.Errorf("failed to write merged cells: %w", err)
+	}
+	if _, err := ws.writer.WriteString(hyperlinksXML(ws.hyperlinks)); err != nil {
+		return fmt.Errorf("failed to write hyperlinks: %w", err)
+	}
+	if _, err := ws.writer.WriteString(worksheetEnd); err != nil {
+		return fmt.Errorf("failed to write the worksheet footer: %w", err)
+	}
 	if err := ws.writer.Flush(); err != nil {
 		return fmt.Errorf("failed to flush the worksheet: %w", err)
 	}
@@ -412,9 +570,35 @@ func (ws *Worksheet) Commit() error {
 		return fmt.Errorf("failed to close %s: %w", ws.filePath, err)
 	}
 
+	if err := ws.writeWorksheetRelationships(); err != nil {
+		return err
+	}
+
 	ws.file = nil
 	ws.writer = nil
 	ws.committed = true
+	return nil
+}
+
+func (ws *Worksheet) writeWorksheetRelationships() error {
+	if len(ws.hyperlinks) == 0 {
+		return nil
+	}
+	var b strings.Builder
+	b.WriteString(worksheetRelsStart)
+	for i, link := range ws.hyperlinks {
+		if strings.HasPrefix(link.target, "#") {
+			b.WriteString(relationshipXML(i+1, contentTypeHyperlinkR, link.target))
+		} else {
+			b.WriteString(externalRelationshipXML(i+1, contentTypeHyperlinkR, link.target))
+		}
+	}
+	b.WriteString(worksheetRelsEnd)
+
+	filePath := filepath.Join(ws.workbook.tempDirs.xlWorksheetRels, ws.fileName+".rels")
+	if err := os.WriteFile(filePath, []byte(b.String()), ws.workbook.options.FileMode); err != nil {
+		return fmt.Errorf("failed to write worksheet relationships to %s: %w", filePath, err)
+	}
 	return nil
 }
 
@@ -451,4 +635,36 @@ func validateSheetName(name string) error {
 		return fmt.Errorf("%w: %q is reserved by Excel", ErrInvalidSheetName, name)
 	}
 	return nil
+}
+
+func normalizeFormula(formula string) (string, error) {
+	formula = strings.TrimPrefix(strings.TrimSpace(formula), "=")
+	if formula == "" {
+		return "", fmt.Errorf("%w: formula cannot be empty", ErrInvalidFormula)
+	}
+	if len([]rune(formula)) > maxFormulaLength {
+		return "", fmt.Errorf("%w: formula exceeds %d characters", ErrInvalidFormula, maxFormulaLength)
+	}
+	for _, r := range formula {
+		if r < 0x20 || r == 0x7f {
+			return "", fmt.Errorf("%w: formula contains a control character", ErrInvalidFormula)
+		}
+	}
+	return formula, nil
+}
+
+func normalizeHyperlink(target string) (string, error) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "", fmt.Errorf("%w: target cannot be empty", ErrInvalidHyperlink)
+	}
+	if len([]rune(target)) > maxHyperlinkLength {
+		return "", fmt.Errorf("%w: target exceeds %d characters", ErrInvalidHyperlink, maxHyperlinkLength)
+	}
+	for _, r := range target {
+		if r < 0x20 || r == 0x7f {
+			return "", fmt.Errorf("%w: target contains a control character", ErrInvalidHyperlink)
+		}
+	}
+	return target, nil
 }

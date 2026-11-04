@@ -3,6 +3,7 @@ package xlsx
 import (
 	"errors"
 	"fmt"
+	"time"
 )
 
 // Row represents a row in a worksheet. A worksheet has a collection of rows.
@@ -12,6 +13,8 @@ type Row struct {
 	cells     []*Cell
 	cellsMap  map[string]*Cell
 	committed bool
+	// Height is the optional row height in points. Zero means the default.
+	Height float64
 }
 
 // CellOptions has options used when creating a new cell.
@@ -25,6 +28,75 @@ type CellOptions struct {
 // Index returns the zero-based index of the row.
 func (r *Row) Index() int {
 	return r.index
+}
+
+// SetHeight sets the row height in points. Excel accepts 0 (default) through
+// 409.
+func (r *Row) SetHeight(height float64) error {
+	if height < 0 || height > 409 {
+		return fmt.Errorf("%w: height must be between 0 and 409", ErrInvalidRow)
+	}
+	r.Height = height
+	return nil
+}
+
+// Append adds a series of values to the row. On keyed worksheets the values
+// are mapped to columns in definition order.
+func (r *Row) Append(values ...interface{}) error {
+	if r.worksheet != nil && r.worksheet.columns != nil && len(values) > len(r.worksheet.columns) {
+		return fmt.Errorf("%w: %d values for %d columns", ErrColumnsDefined, len(values), len(r.worksheet.columns))
+	}
+	for i, value := range values {
+		var (
+			cell *Cell
+			err  error
+		)
+		if r.worksheet != nil && r.worksheet.columns != nil {
+			cell, err = r.AddCellWithKey(r.worksheet.columns[i].Key)
+		} else {
+			cell, err = r.AddCell()
+		}
+		if err != nil {
+			return err
+		}
+		cell.Value = value
+	}
+	return nil
+}
+
+func (r *Row) appendTyped(value interface{}) (*Cell, error) {
+	cell, err := r.AddCell()
+	if err != nil {
+		return nil, err
+	}
+	cell.Value = value
+	return cell, nil
+}
+
+// WriteString appends a string cell. It can only be used on worksheets without
+// keyed columns; use AddCellWithKey for keyed worksheets.
+func (r *Row) WriteString(value string) (*Cell, error) {
+	return r.appendTyped(value)
+}
+
+// WriteInt appends an integer cell.
+func (r *Row) WriteInt(value int64) (*Cell, error) {
+	return r.appendTyped(value)
+}
+
+// WriteFloat appends a floating-point cell.
+func (r *Row) WriteFloat(value float64) (*Cell, error) {
+	return r.appendTyped(value)
+}
+
+// WriteBool appends a boolean cell.
+func (r *Row) WriteBool(value bool) (*Cell, error) {
+	return r.appendTyped(value)
+}
+
+// WriteTime appends a date/time cell.
+func (r *Row) WriteTime(value time.Time) (*Cell, error) {
+	return r.appendTyped(value)
 }
 
 // AddCell adds a new cell to the row. It can only be used on worksheets where
@@ -43,8 +115,8 @@ func (r *Row) AddCell() (*Cell, error) {
 	}
 
 	cellIndex := len(r.cells)
-	if cellIndex >= maxWorksheetColumns {
-		return nil, fmt.Errorf("a worksheet supports at most %d columns", maxWorksheetColumns)
+	if cellIndex >= r.worksheet.maxColumns() {
+		return nil, fmt.Errorf("a worksheet supports at most %d columns", r.worksheet.maxColumns())
 	}
 	cell := &Cell{
 		row:        r,

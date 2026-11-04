@@ -118,3 +118,170 @@ func BenchmarkCommitWorkbook(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkSharedStrings(b *testing.B) {
+	for _, shared := range []bool{false, true} {
+		b.Run(fmt.Sprintf("shared-%t", shared), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				path := filepath.Join(b.TempDir(), fmt.Sprintf("shared-%d.xlsx", i))
+				wb, err := NewWorkbookWithOptions(path, Options{SharedStrings: shared})
+				if err != nil {
+					b.Fatal(err)
+				}
+				ws := wb.AddWorksheet(&WorksheetOptions{Name: "Data"})
+				for rowIndex := 0; rowIndex < 100; rowIndex++ {
+					row, err := ws.AddRow()
+					if err != nil {
+						b.Fatal(err)
+					}
+					for column := 0; column < 5; column++ {
+						if _, err := row.WriteString("repeated value"); err != nil {
+							b.Fatal(err)
+						}
+					}
+				}
+				b.StartTimer()
+				if err := ws.CommitRows(); err != nil {
+					b.Fatal(err)
+				}
+				if err := wb.Commit(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkTypedWrites(b *testing.B) {
+	b.ReportAllocs()
+	wb := NewWorkbook(filepath.Join(b.TempDir(), "typed.xlsx"))
+	ws := wb.AddWorksheet(&WorksheetOptions{Name: "Data"})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		row, err := ws.AddRow()
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := row.WriteString("name"); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := row.WriteInt(int64(i)); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := row.WriteFloat(1.25); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := row.WriteBool(true); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func benchmarkWorkbook(b *testing.B, rows int) string {
+	b.Helper()
+	path := filepath.Join(b.TempDir(), "reader.xlsx")
+	wb := NewWorkbook(path)
+	ws := wb.AddWorksheet(&WorksheetOptions{Name: "Data"})
+	for i := 0; i < rows; i++ {
+		row, err := ws.AddRow()
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := row.WriteString("value"); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := row.WriteInt(int64(i)); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := ws.CommitRows(); err != nil {
+		b.Fatal(err)
+	}
+	if err := wb.Commit(); err != nil {
+		b.Fatal(err)
+	}
+	return path
+}
+
+func BenchmarkReader(b *testing.B) {
+	for _, rows := range []int{100, 1_000} {
+		b.Run(fmt.Sprintf("rows-%d", rows), func(b *testing.B) {
+			path := benchmarkWorkbook(b, rows)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				reader, err := Open(path)
+				if err != nil {
+					b.Fatal(err)
+				}
+				sheet, err := reader.OpenSheet("Data")
+				if err != nil {
+					b.Fatal(err)
+				}
+				count := 0
+				for sheet.Next() {
+					count++
+				}
+				if err := sheet.Err(); err != nil {
+					b.Fatal(err)
+				}
+				if count != rows {
+					b.Fatalf("read %d rows, want %d", count, rows)
+				}
+				_ = sheet.Close()
+				_ = reader.Close()
+			}
+		})
+	}
+}
+
+func BenchmarkValidate(b *testing.B) {
+	path := benchmarkWorkbook(b, 1_000)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := Validate(path); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkStyledFormulas(b *testing.B) {
+	path := filepath.Join(b.TempDir(), "styled-formulas.xlsx")
+	workbook, err := NewWorkbookWithOptions(path, Options{SharedStrings: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	styleID, err := workbook.AddStyle(Style{Bold: true, NumberFormat: "#,##0.00", FillColor: "FFF2CC"})
+	if err != nil {
+		b.Fatal(err)
+	}
+	sheet := workbook.AddWorksheet(&WorksheetOptions{Name: "Data"})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		row, err := sheet.AddRow()
+		if err != nil {
+			b.Fatal(err)
+		}
+		cell, err := row.WriteString("styled")
+		if err != nil {
+			b.Fatal(err)
+		}
+		cell.SetStyle(styleID)
+		formula, err := row.AddCell()
+		if err != nil {
+			b.Fatal(err)
+		}
+		formula.SetFormula("A1&\"x\"")
+	}
+	b.StopTimer()
+	if err := sheet.CommitRows(); err != nil {
+		b.Fatal(err)
+	}
+	if err := workbook.Commit(); err != nil {
+		b.Fatal(err)
+	}
+}

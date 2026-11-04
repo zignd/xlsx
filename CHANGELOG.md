@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-03
+
+### Added
+
+- Streaming `Reader` with `Open`, `OpenReaderAt`, `Sheets`, `OpenSheet`,
+  `SheetReader.Next` and typed cell accessors.
+- Shared-string reading in memory, disk-backed and automatic modes.
+- `Validate`/`ValidateReaderAt` structural XLSX validation.
+- Writer `Options` for temp directory, buffer size, compression, file modes,
+  context cancellation, shared strings and limits.
+- `NewWorkbookWithOptions`, `NewWriter`, `Workbook.Close`, `Workbook.TempDir`
+  and `Workbook.Context`.
+- Typed row and cell helpers (`Append`, `WriteString`, `WriteInt`,
+  `WriteFloat`, `WriteBool`, `WriteTime`, `SetString`, `SetInt`, `SetFloat`,
+  `SetBool`, `SetTime`).
+- Formulas, styles, shared strings, hyperlinks, merged cells, freeze panes,
+  auto-filters and row heights in the writer.
+- `gosec`, CodeQL, fuzz, coverage, openpyxl interoperability and expanded
+  benchmark CI jobs.
+
+### Changed
+
+- Reader limits guard untrusted ZIP and XML input.
+- ZIP entry names are checked for traversal and duplicate entries.
+- Encrypted workbooks and XLSB packages return clear sentinel errors.
+
 ## [0.1.0] - 2026-11-03
 
 ### Added

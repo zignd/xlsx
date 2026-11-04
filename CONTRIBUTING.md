@@ -30,9 +30,28 @@ go test -race ./...
 golangci-lint run
 ```
 
+The interoperability target needs `python3` and `openpyxl`:
+
+```sh
+python3 -m pip install openpyxl
+make interop
+```
+
+For OOXML changes, also run:
+
+```sh
+go test -run '^$' -fuzz=FuzzReader -fuzztime=20s .
+```
+
 Please add tests for behaviour changes and benchmark coverage for hot-path
 changes. Keep the public API backwards compatible unless the change is
 intentional and documented in `CHANGELOG.md`.
+
+## Documentation expectations
+
+Changes to the public API should update `README.md`, `doc.go` and the relevant
+examples. Conformance changes should update the compatibility notes in the
+README and `scripts/check_openpyxl.py`.
 
 ## Commit messages
 
