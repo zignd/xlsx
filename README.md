@@ -35,6 +35,23 @@ go get github.com/zignd/xlsx@latest
 
 Requires Go 1.24 or newer.
 
+## Examples
+
+Runnable programs live in [`examples/`](examples). Each has its own `README.md`
+with instructions and expected output:
+
+```sh
+# Small keyed workbook, then read it back.
+go run ./examples/basic -out /tmp/people.xlsx
+go run ./examples/read -in /tmp/people.xlsx
+
+# A feature-rich dashboard with styles, formulas, merges and 10k rows.
+go run ./examples/complex -out /tmp/dashboard.xlsx -rows 10000
+```
+
+The `Example*` functions in the root tests are documentation examples for
+`go test`; the programs under `examples/` are standalone runnable commands.
+
 ## Writing
 
 ```go
@@ -393,6 +410,7 @@ make test-race   # race detector
 make cover       # coverage profile + function report
 make cover-check # coverage gate
 make interop     # openpyxl interoperability check
+make examples    # run all runnable examples
 make bench       # benchmarks
 make lint        # golangci-lint
 make check       # tidy + format + vet + race tests + lint

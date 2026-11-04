@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   auto-filters and row heights in the writer.
 - `gosec`, CodeQL, fuzz, coverage, openpyxl interoperability and expanded
   benchmark CI jobs.
+- Runnable programs under `examples/` for basic writing/reading, streaming
+  reads and a feature-rich dashboard, each with its own README.
+- `make examples` and an examples smoke-test CI job.
 
 ### Changed
 

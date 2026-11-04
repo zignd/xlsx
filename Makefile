@@ -8,7 +8,7 @@ COVERAGE_FILE ?= coverage.out
 COVERAGE_MIN ?= 70
 BENCHTIME ?= 1s
 
-.PHONY: all build test test-race bench cover cover-check interop lint vet fmt tidy check clean
+.PHONY: all build test test-race bench cover cover-check interop examples lint vet fmt tidy check clean
 
 all: check
 
@@ -39,6 +39,12 @@ interop:
 	$(GO) run ./internal/testgen -out $$tmp/conformance.xlsx; \
 	python3 scripts/check_openpyxl.py $$tmp/conformance.xlsx; \
 	rm -rf $$tmp
+
+examples:
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	$(GO) run ./examples/basic -out $$tmp/basic.xlsx; \
+	$(GO) run ./examples/read -in $$tmp/basic.xlsx -max-rows 3; \
+	$(GO) run ./examples/complex -out $$tmp/complex.xlsx -rows 1000
 
 lint:
 	golangci-lint run
